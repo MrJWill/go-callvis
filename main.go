@@ -1,5 +1,4 @@
 // go-callvis: a tool to help visualize the call graph of a Go program.
-//
 package main
 
 import (
@@ -31,25 +30,29 @@ Flags:
 `
 
 var (
-	focusFlag     = flag.String("focus", "main", "Focus specific package using name or import path.")
-	groupFlag     = flag.String("group", "pkg", "Grouping functions by packages and/or types [pkg, type] (separated by comma)")
+	focusFlag     = flag.String("focus", "main", "指定要分析的package,默认是main")
+	groupFlag     = flag.String("group", "pkg", "按照pkg还是type分组显示,[pkg, type] (separated by comma)")
 	limitFlag     = flag.String("limit", "", "Limit package paths to given prefixes (separated by comma)")
 	ignoreFlag    = flag.String("ignore", "", "Ignore package paths containing given prefixes (separated by comma)")
 	includeFlag   = flag.String("include", "", "Include package paths with given prefixes (separated by comma)")
-	nostdFlag     = flag.Bool("nostd", false, "Omit calls to/from packages in standard library.")
-	nointerFlag   = flag.Bool("nointer", false, "Omit calls to unexported functions.")
+	targeFnFlags  = flag.String("target_fn", "", "指定要分析的函数名,前缀匹配 (separated by comma)")
+	ignoreFnFlags = flag.String("ignore_fn", "", "过滤哪些函数不被分析 (separated by comma)")
+	nostdFlag     = flag.Bool("nostd", false, "去掉标准函数库")
+	nointerFlag   = flag.Bool("nointer", false, "去掉不对外package调用的函数,小写字符开头的函数")
 	testFlag      = flag.Bool("tests", false, "Include test code.")
 	graphvizFlag  = flag.Bool("graphviz", false, "Use Graphviz's dot program to render images.")
 	httpFlag      = flag.String("http", ":7878", "HTTP service address.")
-	skipBrowser   = flag.Bool("skipbrowser", false, "Skip opening browser.")
+	skipBrowser   = flag.Bool("skipbrowser", false, "禁用自动打开浏览器")
 	outputFile    = flag.String("file", "", "output filename - omit to use server mode")
 	outputFormat  = flag.String("format", "svg", "output file format [svg | png | jpg | ...]")
 	cacheDir      = flag.String("cacheDir", "", "Enable caching to avoid unnecessary re-rendering, you can force rendering by adding 'refresh=true' to the URL query or emptying the cache directory")
 	callgraphAlgo = flag.String("algo", CallGraphTypePointer, fmt.Sprintf("The algorithm used to construct the call graph. Possible values inlcude: %q, %q, %q, %q",
 		CallGraphTypeStatic, CallGraphTypeCha, CallGraphTypeRta, CallGraphTypePointer))
 
-	debugFlag   = flag.Bool("debug", false, "Enable verbose log.")
-	versionFlag = flag.Bool("version", false, "Show version and exit.")
+	debugFlag        = flag.Bool("debug", false, "Enable verbose log.")
+	versionFlag      = flag.Bool("version", false, "Show version and exit.")
+	pathFlag         = flag.String("path", "", "要分析的代码路径 如: /path/to/your/code")
+	targetFnTypeFlag = flag.String("filterFnType", "", "caller or callee,表名指定分析的函数，是作为caller还是作为callee")
 )
 
 func init() {
@@ -118,7 +121,7 @@ func outputDot(fname string, outputFormat string) {
 	}
 }
 
-//noinspection GoUnhandledErrorResult
+// noinspection GoUnhandledErrorResult
 func main() {
 	flag.Parse()
 
@@ -146,7 +149,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	http.HandleFunc("/", handler)
+	httpHandle()
 
 	if *outputFile == "" {
 		*outputFile = "output"

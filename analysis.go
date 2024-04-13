@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -31,18 +32,21 @@ const (
 	CallGraphTypePointer               = "pointer"
 )
 
-//==[ type def/func: analysis   ]===============================================
+// ==[ type def/func: analysis   ]===============================================
 type renderOpts struct {
-	cacheDir string
-	focus    string
-	group    []string
-	ignore   []string
-	include  []string
-	limit    []string
-	nointer  bool
-	refresh  bool
-	nostd    bool
-	algo     CallGraphType
+	cacheDir      string
+	focus         []string
+	group         []string
+	ignore        []string
+	include       []string
+	limit         []string
+	nointer       bool
+	refresh       bool
+	nostd         bool
+	algo          CallGraphType
+	targetFnNames []string
+	ignoreFnNames []string
+	targeFnType   string
 }
 
 // mainPackages returns the main packages to analyze.
@@ -60,7 +64,7 @@ func mainPackages(pkgs []*ssa.Package) ([]*ssa.Package, error) {
 	return mains, nil
 }
 
-//==[ type def/func: analysis   ]===============================================
+// ==[ type def/func: analysis   ]===============================================
 type analysis struct {
 	opts      *renderOpts
 	prog      *ssa.Program
@@ -146,21 +150,24 @@ func (a *analysis) DoAnalysis(
 
 func (a *analysis) OptsSetup() {
 	a.opts = &renderOpts{
-		cacheDir: *cacheDir,
-		focus:    *focusFlag,
-		group:    []string{*groupFlag},
-		ignore:   []string{*ignoreFlag},
-		include:  []string{*includeFlag},
-		limit:    []string{*limitFlag},
-		nointer:  *nointerFlag,
-		nostd:    *nostdFlag,
+		cacheDir:      *cacheDir,
+		focus:         []string{*focusFlag},
+		group:         []string{*groupFlag},
+		ignore:        []string{*ignoreFlag},
+		include:       []string{*includeFlag},
+		limit:         []string{*limitFlag},
+		targetFnNames: []string{*targeFnFlags},
+		ignoreFnNames: []string{*ignoreFnFlags},
+		nointer:       *nointerFlag,
+		nostd:         *nostdFlag,
+		targeFnType:   *targetFnTypeFlag,
 	}
 }
 
 func (a *analysis) ProcessListArgs() (e error) {
 	var groupBy []string
 	var ignorePaths []string
-	var includePaths []string
+	var includePaths, funNames, excludeFns, focuses []string
 	var limitPaths []string
 
 	for _, g := range strings.Split(a.opts.group[0], ",") {
@@ -188,6 +195,24 @@ func (a *analysis) ProcessListArgs() (e error) {
 			includePaths = append(includePaths, p)
 		}
 	}
+	for _, p := range strings.Split(a.opts.targetFnNames[0], ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			funNames = append(funNames, p)
+		}
+	}
+	for _, p := range strings.Split(a.opts.focus[0], ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			focuses = append(focuses, p)
+		}
+	}
+	for _, p := range strings.Split(a.opts.ignoreFnNames[0], ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			excludeFns = append(excludeFns, p)
+		}
+	}
 
 	for _, p := range strings.Split(a.opts.limit[0], ",") {
 		p = strings.TrimSpace(p)
@@ -200,15 +225,18 @@ func (a *analysis) ProcessListArgs() (e error) {
 	a.opts.ignore = ignorePaths
 	a.opts.include = includePaths
 	a.opts.limit = limitPaths
+	a.opts.targetFnNames = funNames
+	a.opts.ignoreFnNames = excludeFns
+	a.opts.focus = focuses
 
 	return
 }
 
 func (a *analysis) OverrideByHTTP(r *http.Request) {
 	if f := r.FormValue("f"); f == "all" {
-		a.opts.focus = ""
+		a.opts.focus = []string{""}
 	} else if f != "" {
-		a.opts.focus = f
+		a.opts.focus = []string{f}
 	}
 	if std := r.FormValue("std"); std != "" {
 		a.opts.nostd = false
@@ -218,6 +246,9 @@ func (a *analysis) OverrideByHTTP(r *http.Request) {
 	}
 	if refresh := r.FormValue("refresh"); refresh != "" {
 		a.opts.refresh = true
+	}
+	if p := r.FormValue("focus_type"); p != "" {
+		a.opts.targeFnType = p
 	}
 	if g := r.FormValue("group"); g != "" {
 		a.opts.group[0] = g
@@ -231,6 +262,18 @@ func (a *analysis) OverrideByHTTP(r *http.Request) {
 	if inc := r.FormValue("include"); inc != "" {
 		a.opts.include[0] = inc
 	}
+	if inc := r.FormValue("target_fn"); inc != "" {
+		a.opts.targetFnNames[0] = inc
+	}
+	if inc := r.FormValue("ignore_fn"); inc != "" {
+		a.opts.ignoreFnNames[0] = inc
+	}
+	if inc := r.FormValue("rankdir"); inc != "" {
+		rankdir = inc
+	}
+	if inc := r.FormValue("minlen"); inc != "" {
+		minlen = func() uint { l, _ := strconv.Atoi(inc); return uint(l) }()
+	}
 	return
 }
 
@@ -240,18 +283,18 @@ func (a *analysis) Render() ([]byte, error) {
 	var (
 		err      error
 		ssaPkg   *ssa.Package
-		focusPkg *types.Package
+		focusPkg []*types.Package
 	)
-
-	if a.opts.focus != "" {
-		if ssaPkg = a.prog.ImportedPackage(a.opts.focus); ssaPkg == nil {
-			if strings.Contains(a.opts.focus, "/") {
+	focusPkg = make([]*types.Package, 0)
+	for _, focus := range a.opts.focus {
+		if ssaPkg = a.prog.ImportedPackage(focus); ssaPkg == nil {
+			if strings.Contains(focus, "/") {
 				return nil, fmt.Errorf("focus failed: %v", err)
 			}
 			// try to find package by name
 			var foundPaths []string
 			for _, p := range a.pkgs {
-				if p.Pkg.Name() == a.opts.focus {
+				if p.Pkg.Name() == focus {
 					foundPaths = append(foundPaths, p.Pkg.Path())
 				}
 			}
@@ -268,8 +311,8 @@ func (a *analysis) Render() ([]byte, error) {
 				return nil, fmt.Errorf("focus failed: %v", err)
 			}
 		}
-		focusPkg = ssaPkg.Pkg
-		logf("focusing: %v", focusPkg.Path())
+		focusPkg = append(focusPkg, ssaPkg.Pkg)
+		logf("focusing: %v", ssaPkg.Pkg.Path())
 	}
 
 	dot, err := printOutput(
@@ -283,6 +326,9 @@ func (a *analysis) Render() ([]byte, error) {
 		a.opts.group,
 		a.opts.nostd,
 		a.opts.nointer,
+		a.opts.targetFnNames,
+		a.opts.ignoreFnNames,
+		a.opts.targeFnType,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("processing failed: %v", err)
@@ -296,9 +342,9 @@ func (a *analysis) FindCachedImg() string {
 		return ""
 	}
 
-	focus := a.opts.focus
-	if focus == "" {
-		focus = "all"
+	focus := "all"
+	if len(a.opts.focus) > 0 {
+		focus = a.opts.focus[0]
 	}
 	focusFilePath := focus + "." + *outputFormat
 	absFilePath := filepath.Join(a.opts.cacheDir, focusFilePath)
@@ -317,9 +363,9 @@ func (a *analysis) CacheImg(img string) error {
 		return nil
 	}
 
-	focus := a.opts.focus
-	if focus == "" {
-		focus = "all"
+	focus := "all"
+	if len(a.opts.focus) > 0 {
+		focus = a.opts.focus[0]
 	}
 	absCacheDirPrefix := filepath.Join(a.opts.cacheDir, focus)
 	absCacheDirPath := strings.TrimRightFunc(absCacheDirPrefix, func(r rune) bool {

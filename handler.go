@@ -7,6 +7,9 @@ import (
 	"strings"
 )
 
+func httpHandle() {
+	http.HandleFunc("/", handler)
+}
 func handler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" && !strings.HasSuffix(r.URL.Path, ".svg") {
 		http.NotFound(w, r)
@@ -65,4 +68,3 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	log.Println("serving file:", img)
 	http.ServeFile(w, r, img)
 }
-

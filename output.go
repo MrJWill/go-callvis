@@ -25,13 +25,16 @@ func printOutput(
 	prog *ssa.Program,
 	mainPkg *ssa.Package,
 	cg *callgraph.Graph,
-	focusPkg *types.Package,
+	focusPkg []*types.Package,
 	limitPaths,
 	ignorePaths,
 	includePaths []string,
 	groupBy []string,
 	nostd,
 	nointer bool,
+	targetFnNames []string,
+	ignoreFnNames []string,
+	filterFnType string,
 ) ([]byte, error) {
 	var groupType, groupPkg bool
 	for _, g := range groupBy {
@@ -51,9 +54,10 @@ func printOutput(
 		"labeljust": "c",
 		"fontsize":  "18",
 	}
-	if focusPkg != nil {
+	if len(focusPkg) > 0 {
 		cluster.Attrs["bgcolor"] = "#e6ecfa"
-		cluster.Attrs["label"] = focusPkg.Name()
+		cluster.Attrs["label"] = focusPkg[0].Name()
+
 	}
 
 	var (
@@ -71,78 +75,11 @@ func printOutput(
 	logf("%d include prefixes: %v", len(includePaths), includePaths)
 	logf("no std packages: %v", nostd)
 
-	var isFocused = func(edge *callgraph.Edge) bool {
-		caller := edge.Caller
-		callee := edge.Callee
-		if focusPkg != nil && (caller.Func.Pkg.Pkg.Path() == focusPkg.Path() || callee.Func.Pkg.Pkg.Path() == focusPkg.Path()) {
-			return true
-		}
-		fromFocused := false
-		toFocused := false
-		for _, e := range caller.In {
-			if !isSynthetic(e) && focusPkg != nil &&
-				e.Caller.Func.Pkg.Pkg.Path() == focusPkg.Path() {
-				fromFocused = true
-				break
-			}
-		}
-		for _, e := range callee.Out {
-			if !isSynthetic(e) && focusPkg != nil &&
-				e.Callee.Func.Pkg.Pkg.Path() == focusPkg.Path() {
-				toFocused = true
-				break
-			}
-		}
-		if fromFocused && toFocused {
-			logf("edge semi-focus: %s", edge)
-			return true
-		}
-		return false
-	}
-
-	var inIncludes = func(node *callgraph.Node) bool {
-		pkgPath := node.Func.Pkg.Pkg.Path()
-		for _, p := range includePaths {
-			if strings.HasPrefix(pkgPath, p) {
-				return true
-			}
-		}
-		return false
-	}
-
-	var inLimits = func(node *callgraph.Node) bool {
-		pkgPath := node.Func.Pkg.Pkg.Path()
-		for _, p := range limitPaths {
-			if strings.HasPrefix(pkgPath, p) {
-				return true
-			}
-		}
-		return false
-	}
-
-	var inIgnores = func(node *callgraph.Node) bool {
-		pkgPath := node.Func.Pkg.Pkg.Path()
-		for _, p := range ignorePaths {
-			if strings.HasPrefix(pkgPath, p) {
-				return true
-			}
-		}
-		return false
-	}
-
-	var isInter = func(edge *callgraph.Edge) bool {
-		//caller := edge.Caller
-		callee := edge.Callee
-		if callee.Func.Object() != nil && !callee.Func.Object().Exported() {
-			return true
-		}
-		return false
-	}
-
 	count := 0
-	err := callgraph.GraphVisitEdges(cg, func(edge *callgraph.Edge) error {
+	passMap := make(map[string]bool)
+	edgesStack := make([]*callgraph.Edge, 0)
+	afterOrder := func(edge *callgraph.Edge) error {
 		count++
-
 		caller := edge.Caller
 		callee := edge.Callee
 
@@ -161,8 +98,7 @@ func printOutput(
 		calleePkg := callee.Func.Pkg.Pkg
 
 		// focus specific pkg
-		if focusPkg != nil &&
-			!isFocused(edge) {
+		if !isFocused(edge, focusPkg) {
 			return nil
 		}
 
@@ -180,7 +116,7 @@ func printOutput(
 		include := false
 		// include path prefixes
 		if len(includePaths) > 0 &&
-			(inIncludes(caller) || inIncludes(callee)) {
+			(inIncludes(caller, includePaths) || inIncludes(callee, includePaths)) {
 			logf("include: %s -> %s", caller, callee)
 			include = true
 		}
@@ -188,23 +124,28 @@ func printOutput(
 		if !include {
 			// limit path prefixes
 			if len(limitPaths) > 0 &&
-				(!inLimits(caller) || !inLimits(callee)) {
+				(!inLimits(caller, limitPaths) || !inLimits(callee, limitPaths)) {
 				logf("NOT in limit: %s -> %s", caller, callee)
 				return nil
 			}
 
 			// ignore path prefixes
 			if len(ignorePaths) > 0 &&
-				(inIgnores(caller) || inIgnores(callee)) {
+				(inIgnores(caller, ignorePaths) || inIgnores(callee, ignorePaths)) {
 				logf("IS ignored: %s -> %s", caller, callee)
 				return nil
 			}
 		}
 
-		//var buf bytes.Buffer
-		//data, _ := json.MarshalIndent(caller.Func, "", " ")
-		//logf("call node: %s -> %s\n %v", caller, callee, string(data))
-		logf("call node: %s -> %s (%s -> %s) %v\n", caller.Func.Pkg, callee.Func.Pkg, caller, callee, filenameCaller)
+		if !isFilterFn(caller, callee, targetFnNames, ignoreFnNames, passMap, filterFnType) {
+			return nil
+		}
+		if filterFnType == FilterTypeCallee {
+			passMap[caller.Func.Name()] = true
+		} else {
+			passMap[callee.Func.Name()] = true
+		}
+		logf("call node: %05d %s -> %s (%s -> %s) %v\n", count, caller.Func.Pkg, callee.Func.Pkg, caller, callee, filenameCaller)
 
 		var sprintNode = func(node *callgraph.Node, isCaller bool) *dotNode {
 			// only once
@@ -223,10 +164,8 @@ func printOutput(
 			if n, ok := nodeMap[key]; ok {
 				return n
 			}
-
 			// is focused
-			isFocused := focusPkg != nil &&
-				node.Func.Pkg.Pkg.Path() == focusPkg.Path()
+			isFocused := isFocusPkg([]*types.Package{node.Func.Pkg.Pkg}, focusPkg)
 			attrs := make(dotAttrs)
 
 			// node label
@@ -366,8 +305,7 @@ func printOutput(
 		}
 
 		// colorize calls outside focused pkg
-		if focusPkg != nil &&
-			(calleePkg.Path() != focusPkg.Path() || callerPkg.Path() != focusPkg.Path()) {
+		if isFocusPkg([]*types.Package{callerPkg, calleePkg}, focusPkg) {
 			attrs["color"] = "saddlebrown"
 		}
 
@@ -403,7 +341,21 @@ func printOutput(
 		}
 
 		return nil
-	})
+	}
+	preOder := func(edge *callgraph.Edge) error {
+		edgesStack = append(edgesStack, edge)
+		return nil
+	}
+	visitFunc := afterOrder
+	if filterFnType == "caller" {
+		visitFunc = preOder
+	}
+	err := callgraph.GraphVisitEdges(cg, visitFunc)
+	if len(edgesStack) > 0 {
+		for i := len(edgesStack) - 1; i >= 0; i-- {
+			err = afterOrder(edgesStack[i])
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -445,4 +397,14 @@ func printOutput(
 	}
 
 	return buf.Bytes(), nil
+}
+func isFocusPkg(pkgs []*types.Package, focus []*types.Package) bool {
+	for _, pkg := range focus {
+		for _, p := range pkgs {
+			if p.Path() == pkg.Path() {
+				return true
+			}
+		}
+	}
+	return false
 }
